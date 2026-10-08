@@ -1,0 +1,23 @@
+{
+  "name": "civic-infra-mapper",
+  "version": "1.0.0",
+  "description": "Civic infrastructure issue reporting app with Supabase backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "seed": "node seed.js",
+    "migrate:sqlite": "node migrate-sqlite-to-supabase.js",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.3",
+    "cors": "^2.8.5",
+    "dotenv": "^18.0.6",
+    "express": "^4.21.0",
+    "multer": "^2.4.0"
+  }
+}

@@ -14,9 +14,9 @@ app.innerHTML = `
   <div class="page-shell dashboard-shell">
     <header class="page-header hero-header">
       <div class="hero-copy">
-        <span class="eyebrow">Operations overview</span>
+        <span class="eyebrow">Civic Operations</span>
         <h1>Neighbourhood Civic Infrastructure Dashboard</h1>
-        <p>Monitor civic issues and community conditions across Silvassa.</p>
+        <p>Real-time civic reporting and resolution tracking.</p>
       </div>
       <div class="hero-badges">
         <div class="mini-badge">
@@ -57,7 +57,10 @@ app.innerHTML = `
       <div class="card map-card">
         <div class="section-head">
           <h2>Live Map</h2>
-          <span>Geo snapshot</span>
+          <div style="display:flex; gap:.4rem;">
+            <button type="button" id="toggleHeat" class="btn btn-secondary" style="padding:.35rem .75rem; font-size:.8rem;">🔥 Heatmap</button>
+            <button type="button" id="toggleFocus" class="btn btn-secondary" style="padding:.35rem .75rem; font-size:.8rem;" title="Expand map">⛶ Focus</button>
+          </div>
         </div>
         <div class="map-wrap">
           <div id="dashboardMap"></div>
@@ -118,8 +121,7 @@ function renderStats(stats) {
 }
 
 function renderMap(reports) {
-  // Create the map and tile layer ONCE. Never tear it down on refresh —
-  // doing so cancels in-flight tile requests and leaves the map blank.
+  // Create the map and tile layer ONCE. Never tear it down on refresh.
   if (!dashboardMap) {
     dashboardMap = L.map('dashboardMap').setView(getMapCenter(), 14);
 
@@ -127,11 +129,28 @@ function renderMap(reports) {
       attribution: '&copy; OpenStreetMap contributors',
       maxZoom: 19
     }).addTo(dashboardMap);
+
+    if (window.L && L.control && L.control.locate) {
+      L.control.locate({
+        position: 'topright',
+        strings: { title: 'Show my location' },
+        locateOptions: { maxZoom: 16, enableHighAccuracy: true },
+        flyTo: true,
+        cacheLocation: true
+      }).addTo(dashboardMap);
+    }
   }
 
-  // Replace only the markers layer on each refresh
   if (dashboardMap._reportLayer) dashboardMap.removeLayer(dashboardMap._reportLayer);
-  dashboardMap._reportLayer = L.layerGroup().addTo(dashboardMap);
+  const clusterAvailable = window.L && L.markerClusterGroup;
+  dashboardMap._reportLayer = clusterAvailable
+    ? L.markerClusterGroup({
+        maxClusterRadius: 50,
+        spiderfyOnMaxZoom: true,
+        showCoverageOnHover: false,
+        zoomToBoundsOnClick: true
+      }).addTo(dashboardMap)
+    : L.layerGroup().addTo(dashboardMap);
 
   const markers = [];
   reports.forEach((report) => {
@@ -142,25 +161,35 @@ function renderMap(reports) {
     ) {
       const category = catInfo(report.category);
       const markerColor = getStatusColor(report.status);
-      const marker = L.circleMarker([Number(report.latitude), Number(report.longitude)], {
-        radius: 9,
-        color: markerColor,
-        fillColor: markerColor,
-        fillOpacity: 0.8
-      }).addTo(dashboardMap._reportLayer);
+      const lat = Number(report.latitude);
+      const lng = Number(report.longitude);
 
-      // Compact image inside the popup. Click opens full-size in a new tab.
-      // The popup itself scrolls if content exceeds the map viewport.
+      const marker = clusterAvailable
+        ? L.marker([lat, lng], {
+            icon: L.divIcon({
+              className: 'civic-marker',
+              html: `<div style="background:${markerColor}; width:22px; height:22px; border-radius:50%; border:3px solid white; box-shadow:0 2px 6px rgba(0,0,0,.3);"></div>`,
+              iconSize: [22, 22],
+              iconAnchor: [11, 11],
+              popupAnchor: [0, -11]
+            })
+          }).addTo(dashboardMap._reportLayer)
+        : L.circleMarker([lat, lng], {
+            radius: 9,
+            color: markerColor,
+            fillColor: markerColor,
+            fillOpacity: 0.8
+          }).addTo(dashboardMap._reportLayer);
+
       const photoHtml = report.photo
-        ? `<a href="${escapeHtml(report.photo)}" target="_blank" rel="noopener noreferrer" title="Click to open full size">
-             <img
-               src="${escapeHtml(report.photo)}"
-               alt="Issue photo"
-               style="width:100%; height:auto; max-height:140px; object-fit:contain; background:#f1f5f9; border-radius:8px; display:block; margin-bottom:0.4rem; cursor:zoom-in;"
-             />
-           </a>`
+        ? `<img src="${escapeHtml(report.photo)}" alt="Issue photo"
+             data-lightbox="${escapeHtml(report.photo)}"
+             style="width:100%; height:auto; max-height:140px; object-fit:contain;
+                    background:#f1f5f9; border-radius:8px; display:block;
+                    margin-bottom:0.4rem; cursor:zoom-in;" />`
         : '';
 
+      const popupId = `history-${report.id}`;
       marker.bindPopup(`
         <div style="max-width:250px; max-height:270px; overflow-y:auto; font-size:0.82rem; line-height:1.35; word-wrap:break-word; padding-right:4px;">
           ${photoHtml}
@@ -169,14 +198,59 @@ function renderMap(reports) {
           <strong>Address:</strong> ${escapeHtml(report.address || 'Not provided')}<br>
           <strong>Status:</strong> ${escapeHtml(report.status)}<br>
           <strong>Reporter:</strong> ${escapeHtml(report.reporter_name || 'Anonymous')}
+          <div id="${popupId}"></div>
         </div>
       `, { maxWidth: 270, minWidth: 220, autoPanPadding: [40, 40] });
 
-      markers.push([Number(report.latitude), Number(report.longitude)]);
+      marker.on('popupopen', async () => {
+        const container = document.getElementById(popupId);
+        if (!container) return;
+        try {
+          const history = await api(`/api/reports/${report.id}/history`);
+          if (!Array.isArray(history) || history.length === 0) return;
+          container.innerHTML = `
+            <details style="margin-top:.5rem;">
+              <summary style="cursor:pointer; color:#2563eb; font-weight:600; font-size:.82rem;">📜 Status history (${history.length})</summary>
+              <ul style="list-style:none; padding:.4rem 0 0; margin:0; font-size:.78rem;">
+                ${history.map(h => `
+                  <li style="padding:.2rem 0; color:#475569;">
+                    <strong>${escapeHtml(h.old_status || '—')}</strong> → <strong>${escapeHtml(h.new_status)}</strong>
+                    <br><small>${escapeHtml(timeAgo(h.changed_at))}</small>
+                  </li>
+                `).join('')}
+              </ul>
+            </details>
+          `;
+        } catch (_) { /* history endpoint may not exist yet */ }
+      });
+
+      markers.push([lat, lng]);
     }
   });
 
-  // fitBounds is unreliable with a single marker, so use setView for 1 or 0.
+  // Heatmap
+  if (dashboardMap._heatLayer) {
+    dashboardMap.removeLayer(dashboardMap._heatLayer);
+    dashboardMap._heatLayer = null;
+  }
+  if (window.L && L.heatLayer && reports.length > 0) {
+    const points = reports
+      .filter(r => r.latitude != null && r.longitude != null)
+      .map(r => {
+        const weight = r.severity === 'High' ? 1 : r.severity === 'Medium' ? 0.6 : 0.3;
+        return [Number(r.latitude), Number(r.longitude), weight];
+      });
+    if (points.length > 0) {
+      dashboardMap._heatLayer = L.heatLayer(points, {
+        radius: 28,
+        blur: 18,
+        maxZoom: 15,
+        minOpacity: 0.4,
+        gradient: { 0.2: '#22c55e', 0.5: '#f59e0b', 0.8: '#dc2626' }
+      });
+    }
+  }
+
   if (markers.length > 1) {
     dashboardMap.fitBounds(markers, { padding: [30, 30], maxZoom: 15 });
   } else if (markers.length === 1) {
@@ -277,7 +351,7 @@ function renderRecentReports(recent) {
               ${renderStatusBadge(report.status)}
             </div>
             <small class="recent-desc">${escapeHtml(report.description)}</small>
-            <small class="recent-meta">${timeAgo(report.created_at)} · ${escapeHtml(report.reporter_name || 'Anonymous')}</small>
+            <small class="recent-meta"><time data-timestamp="${escapeHtml(report.created_at)}">${escapeHtml(timeAgo(report.created_at))}</time> · ${escapeHtml(report.reporter_name || 'Anonymous')}</small>
           </div>
         </li>
       `;
@@ -296,9 +370,54 @@ function getStatusColor(status) {
   }
 }
 
-// Debounced realtime reload — avoids rapid-fire redraws
+// Heatmap toggle
+document.getElementById('toggleHeat')?.addEventListener('click', (e) => {
+  if (!dashboardMap || !dashboardMap._heatLayer) {
+    showToast('No data to show on heatmap yet.', 'warning');
+    return;
+  }
+  if (dashboardMap.hasLayer(dashboardMap._heatLayer)) {
+    dashboardMap.removeLayer(dashboardMap._heatLayer);
+    e.currentTarget.textContent = '🔥 Heatmap';
+    e.currentTarget.classList.remove('btn-primary');
+    e.currentTarget.classList.add('btn-secondary');
+  } else {
+    dashboardMap._heatLayer.addTo(dashboardMap);
+    e.currentTarget.textContent = '🔥 Hide heatmap';
+    e.currentTarget.classList.remove('btn-secondary');
+    e.currentTarget.classList.add('btn-primary');
+  }
+});
+
+// Focus mode — makes the map card fill the viewport
+document.getElementById('toggleFocus')?.addEventListener('click', (e) => {
+  const card = document.querySelector('.map-card');
+  if (!card) return;
+  const active = card.dataset.focus === '1';
+  if (active) {
+    card.dataset.focus = '';
+    card.style.position = '';
+    card.style.inset = '';
+    card.style.zIndex = '';
+    card.style.margin = '';
+    card.style.height = '';
+    e.currentTarget.textContent = '⛶ Focus';
+    setTimeout(() => dashboardMap && dashboardMap.invalidateSize(), 50);
+  } else {
+    card.dataset.focus = '1';
+    card.style.position = 'fixed';
+    card.style.inset = '68px 12px 12px 12px';
+    card.style.zIndex = '9000';
+    card.style.margin = '0';
+    card.style.height = 'auto';
+    e.currentTarget.textContent = '✕ Close';
+    setTimeout(() => dashboardMap && dashboardMap.invalidateSize(), 50);
+  }
+});
+
+// Debounced realtime reload
 connectRealtime(() => {
   clearTimeout(realtimeReloadTimer);
   realtimeReloadTimer = setTimeout(() => loadDashboard(), 300);
 });
-loadDashboard(); 
+loadDashboard();

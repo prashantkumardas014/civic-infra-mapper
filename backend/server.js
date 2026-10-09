@@ -50,6 +50,34 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false }
 });
 
+/* ---------- Resend email client (optional) ---------- */
+let resend = null;
+let resendMode = 'disabled';
+try {
+  const { Resend } = require('resend');
+  if (process.env.RESEND_API_KEY) {
+    resend = new Resend(process.env.RESEND_API_KEY);
+    const from = process.env.NOTIFY_FROM || '';
+    resendMode = from.includes('resend.dev') ? 'test' : 'live';
+    console.log(`Email notifications: enabled via Resend (${resendMode} mode)`);
+    if (resendMode === 'test') {
+      console.log(`  Test mode: emails only send to ${process.env.RESEND_OWNER_EMAIL || '(RESEND_OWNER_EMAIL not set — no emails will send)'}`);
+    }
+  } else {
+    console.log('Email notifications: disabled (RESEND_API_KEY not set)');
+  }
+} catch {
+  console.log('Email notifications: disabled (resend package not installed)');
+}
+
+function canSendEmailTo(recipient) {
+  if (!resend) return false;
+  if (resendMode === 'live') return true;
+  const owner = String(process.env.RESEND_OWNER_EMAIL || '').trim().toLowerCase();
+  if (!owner) return false;
+  return String(recipient || '').trim().toLowerCase() === owner;
+}
+
 /* ---------- Helpers ---------- */
 function sendDatabaseError(res, error, operation) {
   console.error(`Supabase ${operation} failed:`, error);
@@ -74,19 +102,10 @@ function publicUser(user) {
   return { id: user.id, name: user.name, email: user.email, role: user.role };
 }
 
-/* ---------- Cross-origin cookie options ----------
- * When frontend and backend are on different origins, the session cookie
- * must be SameSite=None; Secure. Secure requires HTTPS.
- */
 function cookieOptions(req, maxAge) {
   const secure = req.secure || req.get('x-forwarded-proto') === 'https';
   const sameSite = secure ? 'None' : 'Lax';
-  const parts = [
-    'Path=/',
-    'HttpOnly',
-    `SameSite=${sameSite}`,
-    `Max-Age=${Math.max(0, Math.floor(maxAge / 1000))}`
-  ];
+  const parts = ['Path=/', 'HttpOnly', `SameSite=${sameSite}`, `Max-Age=${Math.max(0, Math.floor(maxAge / 1000))}`];
   if (secure) parts.push('Secure');
   return parts.join('; ');
 }
@@ -149,7 +168,7 @@ async function createSession(userId, req, res) {
   res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; ${cookieOptions(req, SESSION_TTL_MS)}`);
 }
 
-/* ---------- Multer (memory upload, images only, 5 MB) ---------- */
+/* ---------- Multer ---------- */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -205,13 +224,6 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
     return sendDatabaseError(res, error, 'create the account');
   }
 
-  try {
-    await createSession(user.id, req, res);
-  } catch (sessionError) {
-    const { error: rollbackError } = await supabase.from('users').delete().eq('id', user.id);
-    if (rollbackError) console.error('Could not clean up account after session creation failed:', rollbackError);
-    return sendDatabaseError(res, sessionError, 'create the sign-in session');
-  }
   return res.status(201).json({ user: publicUser(user) });
 }));
 
@@ -366,10 +378,17 @@ app.get('/api/reports/:id', asyncRoute(async (req, res) => {
   return res.json(data);
 }));
 
-app.post('/api/reports', upload.single('photo'), asyncRoute(async (req, res) => {
-  await optionalAuth(req, res, (error) => {
-    if (error) throw error;
-  });
+app.get('/api/reports/:id/history', asyncRoute(async (req, res) => {
+  const { data, error } = await supabase
+    .from('report_status_history')
+    .select('*')
+    .eq('report_id', req.params.id)
+    .order('changed_at', { ascending: false });
+  if (error) return sendDatabaseError(res, error, 'load report history');
+  return res.json(data);
+}));
+
+app.post('/api/reports', upload.single('photo'), requireAuth, asyncRoute(async (req, res) => {
   if (res.headersSent) return undefined;
 
   const rawCategory = String(req.body.category || '').trim();
@@ -387,8 +406,7 @@ app.post('/api/reports', upload.single('photo'), asyncRoute(async (req, res) => 
   if (description.length > 3000 || address.length > 300) return rejectReport(req, res, 'Description must be under 3000 characters and address under 300 characters.');
 
   const severity = ['Low', 'Medium', 'High'].includes(req.body.severity) ? req.body.severity : 'Medium';
-  const reporterName = req.user ? req.user.name : String(req.body.reporter_name || req.body.reporterName || 'Anonymous').trim() || 'Anonymous';
-  if (reporterName.length > 80) return rejectReport(req, res, 'Reporter name must be 80 characters or fewer.');
+  const reporterName = req.user.name;
 
   let photoUrl;
   try {
@@ -401,7 +419,7 @@ app.post('/api/reports', upload.single('photo'), asyncRoute(async (req, res) => 
   const { data, error } = await supabase.from('reports').insert({
     category, description, address: address || null, latitude, longitude,
     photo: photoUrl, reporter_name: reporterName, severity,
-    status: 'Pending', user_id: req.user ? req.user.id : null
+    status: 'Pending', user_id: req.user.id
   }).select('*').single();
   if (error) {
     if (photoUrl) {
@@ -420,9 +438,58 @@ app.patch('/api/reports/:id', requireAdmin, asyncRoute(async (req, res) => {
   const validStatuses = ['Pending', 'In Progress', 'Resolved'];
   const status = String(req.body.status || '').trim();
   if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Status must be Pending, In Progress, or Resolved.' });
-  const { data, error } = await supabase.from('reports').update({ status }).eq('id', req.params.id).select('*').maybeSingle();
+
+  const { data: existing, error: lookupError } = await supabase
+    .from('reports').select('status').eq('id', req.params.id).maybeSingle();
+  if (lookupError) return sendDatabaseError(res, lookupError, 'load the report');
+  if (!existing) return res.status(404).json({ error: 'Report not found.' });
+
+  const { data, error } = await supabase
+    .from('reports').update({ status }).eq('id', req.params.id).select('*').maybeSingle();
   if (error) return sendDatabaseError(res, error, 'update the report');
-  if (!data) return res.status(404).json({ error: 'Report not found.' });
+
+  if (existing.status !== status) {
+    const { error: historyError } = await supabase.from('report_status_history').insert({
+      report_id: data.id,
+      old_status: existing.status,
+      new_status: status,
+      changed_by: req.user.id
+    });
+    if (historyError) console.warn('Could not record status history:', historyError.message);
+
+    if (resend && data.user_id) {
+      (async () => {
+        try {
+          const { data: reporter } = await supabase
+            .from('users').select('email, name')
+            .eq('id', data.user_id).maybeSingle();
+          if (!reporter?.email) return;
+
+          if (!canSendEmailTo(reporter.email)) {
+            console.log(`Email skipped for ${reporter.email} (not allowed in ${resendMode} mode — set RESEND_OWNER_EMAIL or verify a domain)`);
+            return;
+          }
+
+          await resend.emails.send({
+            from: process.env.NOTIFY_FROM || 'onboarding@resend.dev',
+            to: reporter.email,
+            subject: `Your ${data.category} report is now ${status}`,
+            html: `
+              <div style="font-family:system-ui,-apple-system,sans-serif; max-width:560px; line-height:1.5; color:#0f172a;">
+                <h2 style="color:#2563eb; margin-bottom:.5rem;">Your report status has changed</h2>
+                <p>Hi ${reporter.name || 'there'},</p>
+                <p>Your report "<em>${String(data.description).slice(0, 100)}…</em>" was updated to <strong>${status}</strong>.</p>
+                <p style="color:#64748b; font-size:.9rem; margin-top:1.5rem;">— Civic Infra Mapper</p>
+              </div>`
+          });
+          console.log(`Notification email sent to ${reporter.email} (report ${data.id})`);
+        } catch (emailErr) {
+          console.warn('Email notification failed:', emailErr.message);
+        }
+      })();
+    }
+  }
+
   return res.json(data);
 }));
 
@@ -460,9 +527,6 @@ app.get('/api/stats', asyncRoute(async (req, res) => {
     else if (report.status === 'Resolved') counts.resolved++;
   }
   const recent = reports.slice(0, 5);
-
-  // UPDATED: include address, reporter_name, severity, created_at so map popups
-  // can display complete report details.
   const mapReports = reports
     .filter((report) => report.latitude !== null && report.latitude !== undefined &&
       report.longitude !== null && report.longitude !== undefined)
@@ -481,9 +545,8 @@ app.get('/api/stats', asyncRoute(async (req, res) => {
   });
 }));
 
-/* ---------- Surveys ---------- */
-app.post('/api/surveys', asyncRoute(async (req, res) => {
-  const name = String(req.body.name || '').trim();
+/* ---------- POST /api/surveys — AUTH REQUIRED ---------- */
+app.post('/api/surveys', requireAuth, asyncRoute(async (req, res) => {
   const area = String(req.body.area || '').trim();
   const fields = ['roads', 'drainage', 'streetlights', 'waste', 'water', 'footpaths'];
   const scores = Object.fromEntries(fields.map((field) => {
@@ -492,12 +555,20 @@ app.post('/api/surveys', asyncRoute(async (req, res) => {
   }));
   const biggestProblem = String(req.body.biggest_problem || '').trim();
   const suggestion = String(req.body.suggestion || '').trim();
-  if (Object.values(scores).some((score) => !Number.isInteger(score) || score < 1 || score > 5)) return res.status(400).json({ error: 'Each facility rating must be a whole number from 1 to 5.' });
-  if (name.length > 80 || area.length > 120 || biggestProblem.length > 80 || suggestion.length > 3000) return res.status(400).json({ error: 'Survey text exceeds the allowed length.' });
+
+  if (Object.values(scores).some((score) => !Number.isInteger(score) || score < 1 || score > 5)) {
+    return res.status(400).json({ error: 'Each facility rating must be a whole number from 1 to 5.' });
+  }
+  if (area.length > 120 || biggestProblem.length > 80 || suggestion.length > 3000) {
+    return res.status(400).json({ error: 'Survey text exceeds the allowed length.' });
+  }
 
   const { data, error } = await supabase.from('surveys').insert({
-    name: name || 'Anonymous', area: area || 'Unknown area',
-    ...scores, biggest_problem: biggestProblem || null, suggestion: suggestion || null
+    name: req.user.name,
+    area: area || 'Unknown area',
+    ...scores,
+    biggest_problem: biggestProblem || null,
+    suggestion: suggestion || null
   }).select('*').single();
   if (error) return sendDatabaseError(res, error, 'save the survey response');
   return res.status(201).json(data);
